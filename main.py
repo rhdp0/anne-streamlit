@@ -1,3 +1,4 @@
+
 import re
 from pathlib import Path
 import pandas as pd
@@ -55,7 +56,8 @@ def _normalize_col(col):
          .replace("ó","o").replace("õ","o").replace("ô","o")
          .replace("ú","u").replace("ü","u")
          .replace("ç","c"))
-    c = re.sub(r"\s+", " ", c)
+    c = re.sub(r"[\n\r\t]", " ", c)
+    c = re.sub(r"\s+", " ", c).strip()
     return c
 
 def detect_header_and_parse(excel, sheet_name):
@@ -164,7 +166,7 @@ kc1, kc2 = st.columns(2)
 kc1.metric("Taxa de ocupação", f"{tx_ocup:.1f}%")
 kc2.metric("Médicos distintos (no filtro de sala/dia/turno)", medicos_distintos)
 
-# ---------- Gráficos de ocupação (sem heatmap) com porcentagens nas barras ----------
+# ---------- Gráficos de ocupação ----------
 colA, colB = st.columns(2)
 with colA:
     by_sala = fdf_base.groupby("Sala")["Ocupado"].mean().reset_index()
@@ -359,6 +361,250 @@ else:
     st.markdown("##### Tabela (Médico × CRM × Especialidade × PLANOS × Valor × Tipo de Sala × Turnos)")
     cols_show = [c for c in ["Médico","CRM","Especialidade","Planos","Valor Aluguel","Sala Exclusiva","Sala Dividida","Turnos Utilizados"] if c in med_enriched.columns]
     st.dataframe(med_enriched[cols_show].sort_values(["Planos","Especialidade","Valor Aluguel","Médico"], na_position="last"), use_container_width=True)
+
+# ==================== NOVOS BLOCOS ====================
+# ---------- PRODUTIVIDADE CONSULTÓRIO (1, 2, 3) ----------
+def load_produtividade_from_excel(excel: pd.ExcelFile):
+    frames = []
+    for s in excel.sheet_names:
+        sn = _normalize_col(s)
+        if "produtividade" in sn and "consultorio" in sn:
+            # Tenta ler com header na primeira linha
+            try:
+                dfp = excel.parse(s, header=0)
+            except Exception:
+                continue
+            if dfp is None or dfp.empty:
+                continue
+
+            # Normaliza colunas
+            norm_map = {c: _normalize_col(c) for c in dfp.columns}
+            dfp.columns = [norm_map[c] for c in dfp.columns]
+
+            rename = {}
+            for c in dfp.columns:
+                if "nome" in c: rename[c] = "NOME"
+                elif c == "crm" or "crm" in c: rename[c] = "CRM"
+                elif "especial" in c: rename[c] = "ESPECIALIDADE"
+                elif "exame" in c: rename[c] = "EXAMES SOLICITADOS"
+                elif "cirurg" in c: rename[c] = "CIRURGIAS SOLICITADAS"
+            dfp = dfp.rename(columns=rename)
+
+            keep = [c for c in ["NOME","CRM","ESPECIALIDADE","EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"] if c in dfp.columns]
+            if not keep:
+                continue
+            dfp = dfp[keep].copy()
+
+            # Tipos numéricos para métricas
+            for c in ["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"]:
+                if c in dfp.columns:
+                    dfp[c] = pd.to_numeric(dfp[c], errors="coerce").fillna(0)
+
+            # Extrai nº do consultório do nome da aba
+            m = re.search(r"(\d+)", s)
+            consultorio = f"Consultório {m.group(1)}" if m else s
+            dfp.insert(0, "Consultório", consultorio)
+            frames.append(dfp)
+
+    if not frames:
+        return pd.DataFrame(columns=["Consultório","NOME","CRM","ESPECIALIDADE","EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"])
+    return pd.concat(frames, ignore_index=True)
+
+prod_df = load_produtividade_from_excel(excel)
+
+if not prod_df.empty:
+    st.markdown("---")
+    st.subheader("🧪 Produtividade por Consultório (Exames × Cirurgias)")
+
+    # ------- Filtros do bloco -------
+    cols = st.columns(4)
+    prod_cons_opts = sorted(prod_df["Consultório"].dropna().unique().tolist())
+    prod_esp_opts  = sorted(prod_df["ESPECIALIDADE"].dropna().unique().tolist())
+    prod_med_opts  = sorted(prod_df["NOME"].dropna().unique().tolist())
+
+    sel_prod_cons = cols[0].multiselect("Consultório(s) — Produtividade", prod_cons_opts, default=prod_cons_opts, key="prod_cons")
+    sel_prod_esp  = cols[1].multiselect("Especialidade(s) — Produtividade", prod_esp_opts, default=prod_esp_opts, key="prod_esp")
+    sel_prod_med  = cols[2].multiselect("Médico(s) — Produtividade", prod_med_opts, default=[], key="prod_med",
+                                        help="Deixe vazio para não filtrar por médico.")
+    # Campo de busca rápido (regex simples)
+    search_txt = cols[3].text_input("Busca rápida (nome/especialidade)", value="", key="prod_busca")
+
+    mask = (
+        prod_df["Consultório"].isin(sel_prod_cons) &
+        prod_df["ESPECIALIDADE"].isin(sel_prod_esp) &
+        (prod_df["NOME"].isin(sel_prod_med) if sel_prod_med else True)
+    )
+    pdf = prod_df[mask].copy()
+    if search_txt.strip():
+        pattern = re.escape(search_txt.strip())
+        mask_q = (
+            prod_df["NOME"].str.contains(pattern, case=False, na=False) |
+            prod_df["ESPECIALIDADE"].str.contains(pattern, case=False, na=False)
+        )
+        pdf = pdf[mask & mask_q].copy()
+
+    pdf["TOTAL SOLICITAÇÕES"] = pdf.get("EXAMES SOLICITADOS", 0) + pdf.get("CIRURGIAS SOLICITADAS", 0)
+
+    # ------- KPIs -------
+    total_exames = int(pdf.get("EXAMES SOLICITADOS", pd.Series(dtype=int)).sum())
+    total_cirurg = int(pdf.get("CIRURGIAS SOLICITADAS", pd.Series(dtype=int)).sum())
+    medicos_unicos = pdf["NOME"].nunique()
+    esp_unicas = pdf["ESPECIALIDADE"].nunique()
+    razao_cir_exa = (total_cirurg / total_exames) if total_exames > 0 else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total de exames solicitados", f"{total_exames:,}".replace(",", "."))
+    k2.metric("Total de cirurgias solicitadas", f"{total_cirurg:,}".replace(",", "."))
+    k3.metric("Médicos (no filtro)", medicos_unicos)
+    k4.metric("Razão cirurgias/exames", f"{razao_cir_exa:.2f}")
+
+    # ------- Gráficos -------
+    gA, gB = st.columns(2)
+    with gA:
+        # Top médicos por total
+        top_med = (pdf.groupby("NOME")[["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"]]
+                   .sum()
+                   .assign(TOTAL=lambda d: d.sum(axis=1))
+                   .sort_values("TOTAL", ascending=False)
+                   .head(15)
+                   .reset_index())
+        if not top_med.empty:
+            fig = px.bar(top_med, x="TOTAL", y="NOME", orientation="h",
+                         title="Top 15 médicos por solicitações (Exames + Cirurgias)",
+                         text="TOTAL")
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Sem dados para o filtro atual.")
+
+    with gB:
+        # Exames x Cirurgias por especialidade (agrupado)
+        esp_grp = (pdf.groupby("ESPECIALIDADE")[["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"]]
+                   .sum()
+                   .reset_index())
+        if not esp_grp.empty:
+            fig = px.bar(esp_grp, x="ESPECIALIDADE", y=["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"],
+                         barmode="group", title="Exames × Cirurgias por Especialidade")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Sem dados por especialidade para o filtro atual.")
+
+    gC, gD = st.columns(2)
+    with gC:
+        # Donut Exames vs Cirurgias (proporção)
+        dist_total = pd.DataFrame({
+            "Tipo": ["Exames", "Cirurgias"],
+            "Quantidade": [total_exames, total_cirurg]
+        })
+        fig = px.pie(dist_total, names="Tipo", values="Quantidade", hole=0.5,
+                     title="Proporção — Exames × Cirurgias")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with gD:
+        # Comparativo por consultório (stacked)
+        cons_grp = (pdf.groupby("Consultório")[["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"]]
+                    .sum()
+                    .reset_index())
+        if not cons_grp.empty:
+            fig = px.bar(cons_grp, x="Consultório", y=["EXAMES SOLICITADOS","CIRURGIAS SOLICITADAS"],
+                         barmode="group", title="Solicitações por Consultório")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Sem dados por consultório para o filtro atual.")
+
+    st.markdown("##### Tabela — Produtividade detalhada")
+    st.dataframe(pdf.sort_values(["Consultório","ESPECIALIDADE","NOME"]).reset_index(drop=True),
+                 use_container_width=True)
+
+# ---------- CONSULTAS MARCADAS (BLOCO INDIVIDUAL) ----------
+def load_consultas_marcadas(excel: pd.ExcelFile):
+    target_name = None
+    for s in excel.sheet_names:
+        if _normalize_col(s) == "consultas marcadas":
+            target_name = s
+            break
+    if target_name is None:
+        # tenta contém
+        for s in excel.sheet_names:
+            if "consulta" in _normalize_col(s) and "marcada" in _normalize_col(s):
+                target_name = s
+                break
+    if target_name is None:
+        return pd.DataFrame(columns=["Especialidade","Quantidade"])
+
+    dfc = excel.parse(target_name, header=0)
+    if dfc is None or dfc.empty:
+        return pd.DataFrame(columns=["Especialidade","Quantidade"])
+
+    # Normaliza colunas
+    cols_map = {c:_normalize_col(c) for c in dfc.columns}
+    dfc.columns = [cols_map[c] for c in dfc.columns]
+    rename = {}
+    for c in dfc.columns:
+        if "especial" in c: rename[c] = "Especialidade"
+        elif "quant" in c: rename[c] = "Quantidade"
+    dfc = dfc.rename(columns=rename)
+
+    keep = [c for c in ["Especialidade","Quantidade"] if c in dfc.columns]
+    if not keep:
+        return pd.DataFrame(columns=["Especialidade","Quantidade"])
+    dfc = dfc[keep].copy()
+    dfc["Quantidade"] = pd.to_numeric(dfc["Quantidade"], errors="coerce").fillna(0).astype(int)
+    dfc["Especialidade"] = dfc["Especialidade"].astype(str).str.strip()
+    dfc = dfc[dfc["Especialidade"].str.len()>0]
+    return dfc
+
+cons_df = load_consultas_marcadas(excel)
+
+if not cons_df.empty:
+    st.markdown("---")
+    st.subheader("📅 Consultas Marcadas — Bloco Individual")
+
+    # Filtros simples
+    cA, cB, cC = st.columns(3)
+    esp_opts = sorted(cons_df["Especialidade"].unique().tolist())
+    sel_esp = cA.multiselect("Especialidade(s)", esp_opts, default=esp_opts, key="cons_esp")
+    top_n = int(cB.number_input("Top N (barras)", min_value=3, max_value=50, value=min(10, len(esp_opts)), step=1, key="cons_topn"))
+    show_pie = cC.checkbox("Mostrar pizza (participação %)", value=True, key="cons_pie")
+
+    cdf = cons_df[cons_df["Especialidade"].isin(sel_esp)].copy()
+
+    # KPIs
+    total_cons = int(cdf["Quantidade"].sum())
+    esp_count = cdf["Especialidade"].nunique()
+    esp_top = cdf.sort_values("Quantidade", ascending=False).head(1)
+    top_name = esp_top["Especialidade"].iloc[0] if not esp_top.empty else "—"
+    top_val = int(esp_top["Quantidade"].iloc[0]) if not esp_top.empty else 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total de consultas marcadas", f"{total_cons:,}".replace(",", "."))
+    m2.metric("Especialidades no filtro", esp_count)
+    m3.metric("Mais demandada", f"{top_name} ({top_val})")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        rank = cdf.sort_values("Quantidade", ascending=False).head(top_n)
+        if not rank.empty:
+            fig = px.bar(rank, x="Quantidade", y="Especialidade", orientation="h",
+                         title=f"Top {len(rank)} especialidades por consultas marcadas", text="Quantidade")
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Sem dados para exibir nas barras.")
+
+    with g2:
+        if show_pie and not cdf.empty:
+            fig = px.pie(cdf, names="Especialidade", values="Quantidade", hole=0.5,
+                         title="Participação por especialidade (%)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Pizza desativada ou sem dados.")
+
+    st.markdown("##### Tabela — Consultas por Especialidade")
+    st.dataframe(cdf.sort_values(["Quantidade","Especialidade"], ascending=[False, True]).reset_index(drop=True),
+                 use_container_width=True)
+
+# ==================== FIM DOS NOVOS BLOCOS ====================
 
 # ---------- Detalhamento ----------
 st.subheader("📋 Agenda Detalhada (Tabela)")
